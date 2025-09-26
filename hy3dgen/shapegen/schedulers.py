@@ -317,6 +317,78 @@ class FlowMatchEulerDiscreteScheduler(SchedulerMixin, ConfigMixin):
 
         return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
 
+    def step_ours(
+        self,
+        model_output: torch.FloatTensor,
+        timestep: Union[float, torch.FloatTensor],
+        sample: torch.FloatTensor,
+        s_churn: float = 0.0,
+        s_tmin: float = 0.0,
+        s_tmax: float = float("inf"),
+        s_noise: float = 1.0,
+        generator: Optional[torch.Generator] = None,
+        return_dict: bool = True,
+    ) -> Union[FlowMatchEulerDiscreteSchedulerOutput, Tuple]:
+        """
+        Modified step function with dual-branch optimization on target velocity.
+        Source acts as anchor; target is refined by inner optimization loop.
+        """
+        if isinstance(timestep, (int, torch.IntTensor, torch.LongTensor)):
+            raise ValueError("Use scheduler.timesteps as timestep.")
+
+        if self.step_index is None:
+            self._init_step_index(timestep)
+
+        # Upcast
+        sample = sample.to(torch.float32)
+
+        sigma = self.sigmas[self.step_index]
+        sigma_next = self.sigmas[self.step_index + 1]
+
+        if self.step_index < 11 or self.step_index > 17:
+            prev_sample = sample + (sigma_next - sigma) * model_output
+            prev_sample = prev_sample.to(model_output.dtype)
+        else:
+            with torch.enable_grad():
+                        # Split target/source
+                        sample_target, sample_source = sample[0:1], sample[1:2]
+                        model_output_target, model_output_source = model_output[0:1], model_output[1:2]
+
+                        # Wrap v_target as a learnable parameter
+                        v_target = torch.nn.Parameter(model_output_target.clone().detach())  # Independent grad
+                        v_source = model_output_source.detach()  # Anchor, no grad
+
+                        # Optimize v_target with loss and smoothness
+                        optimizer = torch.optim.Adam([v_target], lr=0.001)  # Lower lr
+                        for _ in range(5):  # K=5 iterations
+                            L_match = torch.norm((sample_target - sample_source) - 0.5 * (v_target - v_source), p=2)**2
+                            L_reg = 0.05 * torch.norm(v_target, p=2) + 0.1 * self.entropy(v_target)
+                            
+                            L = L_match + L_reg
+                            optimizer.zero_grad()
+                            L.backward(retain_graph=True)
+                            optimizer.step()
+
+            # === Update ===
+            prev_sample_target = sample_target + (sigma_next - sigma) * v_target
+            prev_sample_source = sample_source + (sigma_next - sigma) * v_source
+
+            # Combine back
+            prev_sample = torch.cat([prev_sample_target, prev_sample_source], dim=0)
+            prev_sample = prev_sample.to(model_output.dtype)
+
+        self._step_index += 1
+
+        if not return_dict:
+            return (prev_sample,)
+
+        return FlowMatchEulerDiscreteSchedulerOutput(prev_sample=prev_sample)
+
+    def entropy(self, v: torch.Tensor):
+        """Entropy regularization (correct approximation)"""
+        p = torch.softmax(v, dim=-1)
+        return -torch.sum(p * torch.log(p + 1e-10), dim=-1).mean()
+    
     def __len__(self):
         return self.config.num_train_timesteps
 

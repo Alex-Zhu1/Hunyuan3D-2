@@ -423,7 +423,7 @@ class Hunyuan3DDiTPipeline:
     @synchronize_timer('Encode cond')
     def encode_cond(self, image, additional_cond_inputs, do_classifier_free_guidance, dual_guidance):
         bsz = image.shape[0]
-        cond = self.conditioner(image=image, **additional_cond_inputs)
+        cond = self.conditioner(image=image, **additional_cond_inputs) # DinoImageEncoder
 
         if do_classifier_free_guidance:
             un_cond = self.conditioner.unconditional_embedding(bsz, **additional_cond_inputs)
@@ -679,7 +679,8 @@ class Hunyuan3DDiTPipeline:
 
 class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
+    @torch.no_grad()
     def __call__(
         self,
         image: Union[str, List[str], Image.Image, dict, List[dict]] = None,
@@ -710,14 +711,52 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
             self.model.guidance_embed is True
         )
 
-        cond_inputs = self.prepare_image(image)
+        cond_inputs = self.prepare_image(image)  # 这里是处理image
+        # import torch
+        # import numpy as np
+        # from PIL import Image
+
+        # # Helper function: tensor -> numpy
+        # def tensor_to_numpy(tensor):
+        #     # 如果在GPU，先转CPU
+        #     tensor = tensor.cpu() if tensor.is_cuda else tensor
+        #     # 处理 batch [B, C, H, W] -> 取第一个
+        #     if tensor.dim() == 4:
+        #         tensor = tensor[0]
+        #     # [C, H, W] -> [H, W, C]
+        #     arr = tensor.permute(1, 2, 0).numpy()
+        #     return arr
+
+        # # 提取 cond_inputs
+        # image_tensor = cond_inputs['image']
+        # mask_tensor = cond_inputs['mask']
+
+        # # 转换为 numpy
+        # image_np = tensor_to_numpy(image_tensor)
+        # mask_np = tensor_to_numpy(mask_tensor)
+
+        # # ===== 处理 image =====
+        # if image_np.max() <= 1.0:
+        #     image_np = (image_np * 255).astype(np.uint8)
+
+        # # ===== 处理 mask (值域 [-1, 1]) =====
+        # # 映射 [-1, 1] -> [0, 255]
+        # mask_np = ((mask_np + 1.0) / 2.0 * 255).astype(np.uint8)
+
+        # # 保存结果
+        # Image.fromarray(image_np).save("cond_inputs_image.png")
+        # # 如果 mask 是单通道，去掉最后一维再保存
+        # if mask_np.ndim == 3 and mask_np.shape[-1] == 1:
+        #     mask_np = mask_np[:, :, 0]
+        # Image.fromarray(mask_np).save("cond_inputs_mask.png")
+
         image = cond_inputs.pop('image')
         cond = self.encode_cond(
             image=image,
             additional_cond_inputs=cond_inputs,
             do_classifier_free_guidance=do_classifier_free_guidance,
             dual_guidance=False,
-        )
+        )   # dino 特征
         batch_size = image.shape[0]
 
         # 5. Prepare timesteps
@@ -729,8 +768,7 @@ class Hunyuan3DDiTFlowMatchingPipeline(Hunyuan3DDiTPipeline):
             device,
             sigmas=sigmas,
         )
-        latents = self.prepare_latents(batch_size, dtype, device, generator)
-
+        latents = self.prepare_latents(batch_size, dtype, device, generator) # bs 3072 64
         guidance = None
         if hasattr(self.model, 'guidance_embed') and \
             self.model.guidance_embed is True:

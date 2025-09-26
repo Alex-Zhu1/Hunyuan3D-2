@@ -152,6 +152,100 @@ class Modulation(nn.Module):
         )
 
 
+class DoubleStreamBlock1(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float,
+        qkv_bias: bool = False,
+    ):
+        super().__init__()
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+        self.img_mod = Modulation(hidden_size, double=True)
+        self.img_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
+
+        self.img_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.img_mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+
+        self.txt_mod = Modulation(hidden_size, double=True)
+        self.txt_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_attn = SelfAttention(dim=hidden_size, num_heads=num_heads, qkv_bias=qkv_bias)
+
+        self.txt_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.txt_mlp = nn.Sequential(
+            nn.Linear(hidden_size, mlp_hidden_dim, bias=True),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
+        )
+        # Store separated outputs
+        self.sep_hands = None
+        self.sep_objects = None
+
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, apply_k_fusion: bool = False) -> Tuple[Tensor, Tensor]:
+        B, seq_txt, _ = txt.shape
+        _, seq_img, _ = img.shape
+        # print("img shape in dual-attn: {}".format(seq_img))
+        # print("txt shape in dual-attn: {}".format(seq_txt))
+        head_dim = self.hidden_size // self.num_heads
+
+        img_mod1, img_mod2 = self.img_mod(vec)
+        txt_mod1, txt_mod2 = self.txt_mod(vec)
+
+        # img branch (latent)
+        img_modulated = self.img_norm1(img)
+        img_modulated = (1 + img_mod1.scale) * img_modulated + img_mod1.shift
+        img_qkv = self.img_attn.qkv(img_modulated)  # (B, seq_img, 3*hidden_size)
+        img_q, img_k, img_v = rearrange(img_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+
+        # txt branch (DINO features, unchanged)
+        txt_modulated = self.txt_norm1(txt)
+        txt_modulated = (1 + txt_mod1.scale) * txt_modulated + txt_mod1.shift
+        txt_qkv = self.txt_attn.qkv(txt_modulated)  # (B, seq_txt, 3*hidden_size)
+        txt_q, txt_k, txt_v = rearrange(txt_qkv, "B L (K H D) -> K B H L D", K=3, H=self.num_heads)
+        txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+
+        # img_k fusion before concat
+        self.sep_hands = None
+        self.sep_objects = None
+        if True:
+            if B == 4:  # Classifier-free guidance: original_con (0), object_con (1), original_un (2), object_un (3)
+                alpha = 0.3
+                pairs = [(0, 1), (2, 3)]  # original_idx, object_idx
+                for original_idx, object_idx in pairs:
+                    img_k[0, original_idx] = alpha * img_k[0, original_idx] + (1 - alpha) * img_k[0, object_idx]
+                    img_v[0, original_idx] = alpha * img_v[0, original_idx] + (1 - alpha) * img_v[0, object_idx]
+                    # dino特征
+                    txt_k[0, original_idx] = alpha * txt_k[0, original_idx] + (1 - alpha) * txt_k[0, object_idx]
+                    txt_v[0, original_idx] = alpha * txt_v[0, original_idx] + (1 - alpha) * txt_v[0, object_idx]
+            else:
+                assert B == 4, "k_fusion is only supported for batch size B == 4 (classifier-free guidance)"
+        else:
+            pass
+
+        # Concatenate for attention
+        q = torch.cat((txt_q, img_q), dim=2)  # (K=1, B, H, seq_txt+seq_img, head_dim)
+        k = torch.cat((txt_k, img_k), dim=2)
+        v = torch.cat((txt_v, img_v), dim=2)
+
+        attn = attention(q, k, v, pe=pe)
+        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
+
+        img = img + img_mod1.gate * self.img_attn.proj(img_attn)
+        img = img + img_mod2.gate * self.img_mlp((1 + img_mod2.scale) * self.img_norm2(img) + img_mod2.shift)
+
+        txt = txt + txt_mod1.gate * self.txt_attn.proj(txt_attn)
+        txt = txt + txt_mod2.gate * self.txt_mlp((1 + txt_mod2.scale) * self.txt_norm2(txt) + txt_mod2.shift)
+        return img, txt
+
 class DoubleStreamBlock(nn.Module):
     def __init__(
         self,
@@ -186,7 +280,7 @@ class DoubleStreamBlock(nn.Module):
             nn.Linear(mlp_hidden_dim, hidden_size, bias=True),
         )
 
-    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, apply_k_fusion: bool = False) -> Tuple[Tensor, Tensor]:
         img_mod1, img_mod2 = self.img_mod(vec)
         txt_mod1, txt_mod2 = self.txt_mod(vec)
 
@@ -398,8 +492,26 @@ class Hunyuan3DDiT(nn.Module):
         cond = self.cond_in(cond)
         pe = None
 
-        for block in self.double_blocks:
-            latent, cond = block(img=latent, txt=cond, vec=vec, pe=pe)
+        # Define which blocks and timesteps to apply k-fusion
+        # k_fusion_blocks = range(4, 15)  # Apply k-fusion to blocks 4 to 11 (0-based indexing)
+        # k_fusion_timesteps = range(10, 25)  # Apply k-fusion at timesteps 10 to 20
+
+        k_fusion_blocks = range(1, 15)  # Apply k-fusion to blocks 4 to 11 (0-based indexing)
+        k_fusion_timesteps = range(1, 29)  # Apply k-fusion at timesteps 10 to 20
+
+        # Check if current timestep is in the k-fusion range
+        apply_k_fusion = int(t.item()) in k_fusion_timesteps if t.numel() == 1 else False
+
+        # for block in self.double_blocks:
+        #     latent, cond = block(img=latent, txt=cond, vec=vec, pe=pe)
+        for i, block in enumerate(self.double_blocks):
+            latent, cond = block(
+                img=latent,
+                txt=cond,
+                vec=vec,
+                pe=pe,
+                apply_k_fusion=apply_k_fusion and i in k_fusion_blocks
+            )
 
         latent = torch.cat((cond, latent), 1)
         for block in self.single_blocks:
